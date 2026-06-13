@@ -1,90 +1,143 @@
-# Expression Optimizer
+# expr-optimize
 
-**Expression optimization** is the process of transforming an abstract syntax tree (AST) into a semantically equivalent but more efficient form through constant folding, algebraic simplification, and dead-branch elimination.
+**AST-level expression optimization** in pure Rust: constant folding, algebraic simplification identities (x+0, x×1, x×0, x−0, x/1), boolean short-circuit elimination, double-negation removal, and dead-branch pruning for ternary conditionals. A minimal compiler optimization pass.
 
 ## Why It Matters
 
-Every compiler and query planner performs optimization passes. Without them, `x + 0` would waste a CPU cycle, `0 * x` would compute a pointless product, and `true ? a : b` would evaluate both branches. In database engines like PostgreSQL and query frameworks like Apache Calcite, algebraic identities such as `x * 1 = x` and boolean short-circuits reduce evaluation cost by orders of magnitude on large datasets. This crate implements these classical optimizations in a standalone, zero-dependency Rust library, making the techniques transparent and auditable.
+Every modern compiler (LLVM, GCC, rustc) performs constant folding and algebraic simplification in its early optimization passes. These transformations reduce code size and improve runtime performance without changing semantics — the optimized AST evaluates to the same value as the original.
+
+This crate implements these optimizations for a small expression language with arithmetic (`+`, `−`, `×`, `÷`), boolean (`&&`, `||`, `!`), and ternary (`?:`) operators. It demonstrates the core techniques that production compilers use:
+
+1. **Constant folding**: Evaluate sub-expressions at compile time when all operands are literals.
+2. **Algebraic identities**: Replace expressions with simpler equivalents (x + 0 → x).
+3. **Boolean simplification**: Short-circuit evaluation eliminates unreachable branches (false && x → false).
+4. **Ternary pruning**: If the condition is known, eliminate the dead branch.
 
 ## How It Works
 
-The optimizer performs a **bottom-up rewrite** of the expression tree. Each subtree is optimized before its parent, so simplifications cascade upward: folding `2 + 3 * 4` first collapses `3 * 4 → 12`, then `2 + 12 → 14`.
+### AST Representation
 
-### Constant Folding
-
-When both operands of a binary node are literals, the optimizer evaluates them at compile time:
-
+```rust
+enum Expr {
+    Lit(f64),               // Numeric literal
+    Bool(bool),             // Boolean literal
+    Var(String),            // Variable reference
+    Binary { op, left, right },  // Binary operation
+    Not(Box<Expr>),         // Logical negation
+    Ternary { cond, then, else_ }, // Conditional expression
+}
 ```
-Lit(a) op Lit(b) → Lit(a op b)     // O(1) per node
-```
 
-### Algebraic Identities
+### Optimization: Recursive Bottom-Up Rewriting
 
-The optimizer checks for **annihilators** and **identities** — elements that reduce an expression to a simpler form without full evaluation:
+The `optimize()` function recursively optimizes children before applying local rewrite rules. This bottom-up traversal ensures that simplifications compose: if a child simplifies to a literal, the parent can then fold.
 
-| Identity | Result |
-|----------|--------|
-| `x + 0`  | `x`    |
-| `0 + x`  | `x`    |
-| `x * 1`  | `x`    |
-| `x * 0`  | `0`    |
-| `x - 0`  | `x`    |
-| `x / 1`  | `x`    |
+**Complexity**: O(n) per pass, where n = number of AST nodes. Each node is visited exactly once. The recursive depth is O(d) where d = tree depth (stack usage).
 
-### Boolean Short-Circuit
+### Rewrite Rules
 
-For logical operators, known operands trigger immediate collapse:
-- `false && x → false` (left annihilator)
-- `true && x → x` (left identity)
-- `true || x → true` (left annihilator)
-- `x || false → x` (right identity)
+#### Constant Folding (arithmetic)
 
-### Double Negation and Ternary
+When both operands are literals, evaluate at compile time:
 
-`!!x → x` eliminates redundant negation. For ternary expressions `(c ? t : e)`, if the condition is a known boolean the optimizer selects the branch directly; if both branches are structurally identical, the condition alone suffices.
+| Expression | Result |
+|-----------|--------|
+| `Lit(a) + Lit(b)` | `Lit(a + b)` |
+| `Lit(a) − Lit(b)` | `Lit(a − b)` |
+| `Lit(a) × Lit(b)` | `Lit(a × b)` |
+| `Lit(a) ÷ Lit(b)` | `Lit(a / b)` if b ≠ 0 |
 
-### Complexity
+#### Algebraic Identities
 
-Each pass is **O(n)** in the number of AST nodes — a single traversal with no fixpoint iteration needed for these peephole rewrites.
+| Rule | Simplification | Justification |
+|------|---------------|---------------|
+| `x + 0` | `x` | Additive identity |
+| `0 + x` | `x` | Additive identity (commutative) |
+| `x × 1` | `x` | Multiplicative identity |
+| `1 × x` | `x` | Multiplicative identity (commutative) |
+| `x × 0` | `0` | Annihilator |
+| `0 × x` | `0` | Annihilator (commutative) |
+| `x − 0` | `x` | Subtractive identity |
+| `x ÷ 1` | `x` | Division identity |
+
+#### Boolean Short-Circuit
+
+| Rule | Result | Reason |
+|------|--------|--------|
+| `false && x` | `false` | False dominates AND |
+| `true && x` | `x` | Identity for AND |
+| `true \|\| x` | `true` | True dominates OR |
+| `false \|\| x` | `x` | Identity for OR |
+
+#### Negation and Ternary
+
+| Rule | Result |
+|------|--------|
+| `!!x` | `x` (double negation) |
+| `!(true/false)` | `false/true` (constant) |
+| `true ? a : b` | `a` (dead branch elimination) |
+| `false ? a : b` | `b` (dead branch elimination) |
+| `c ? a : a` | `c` (identical branches, side-effect free) |
+
+### Soundness
+
+All transformations are semantics-preserving: the optimized expression evaluates to the same value as the original for all variable bindings. The proof is by case analysis on each rewrite rule — each rule is an instance of a well-known algebraic law (identity, annihilator, dominance, idempotence).
+
+### Division by Zero
+
+The optimizer deliberately does *not* fold `Lit(a) / Lit(0.0)` — it preserves the expression so that runtime evaluation produces `Infinity` or `NaN` as expected, rather than silently producing a wrong value at compile time.
 
 ## Quick Start
 
 ```rust
+// The library is currently structured as a binary with a optimize() function.
 // See src/main.rs for the full implementation.
-// Run the demo:
-// $ cargo run
 
-fn main() {
-    // The optimizer transforms:
-    //   "x + 0"       → "x"
-    //   "x * 1"       → "x"
-    //   "2 + 3 * 4"   → "14"
-    //   "0 * x"       → "0"
-    //   "!!true"      → "true"
-    //   "true ? a : b" → "a"
-}
+// Example transformations:
+// "x + 0"     → "x"
+// "x * 1"     → "x"
+// "2 + 3 * 4" → "14"     (constant folding: 2 + 12 = 14)
+// "0 * x"     → "0"      (annihilator)
+// "!!true"    → "true"   (double negation)
+// "true ? a : b" → "a"   (dead branch pruning)
+// "x && false"   → "false" (short-circuit)
+// "y / 1"     → "y"      (division identity)
 ```
 
 ## API
 
-| Type / Function | Description |
-|----------------|-------------|
-| `Expr` | AST enum: `Lit(f64)`, `Bool(bool)`, `Var(String)`, `Binary`, `Not`, `Ternary` |
-| `BinOp` | Binary operator enum: `Add`, `Sub`, `Mul`, `Div`, `And`, `Or` |
-| `optimize(expr: Expr) → Expr` | Apply all optimization passes recursively |
-| `display(expr: &Expr) → String` | Pretty-print an expression tree |
+### `Expr` (AST)
+- `Lit(f64)` — Numeric literal
+- `Bool(bool)` — Boolean literal
+- `Var(String)` — Variable reference
+- `Binary { op: BinOp, left: Box<Expr>, right: Box<Expr> }` — Binary operation
+- `Not(Box<Expr>)` — Logical negation
+- `Ternary { cond, then_br, else_br }` — Conditional
+
+### `BinOp`
+`Add` | `Sub` | `Mul` | `Div` | `And` | `Or`
+
+### Functions
+- `optimize(expr: Expr) -> Expr` — Apply all optimization passes recursively
+- `display(expr: &Expr) -> String` — Pretty-print an expression
 
 ## Architecture Notes
 
-This crate is part of the **SuperInstance** expression pipeline: `expr-parser` produces the AST, `expr-typecheck` validates it, and `expr-optimize` reduces it before evaluation. Together they implement the correctness-efficiency duality **γ + η = C** — where γ (type safety) and η (optimization) combine to produce correct, efficient computation.
+This crate provides the optimization pass for expression ASTs in the SuperInstance stack. It connects to:
 
-See [ARCHITECTURE.md](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md) for the full system design.
+- **expr-parser** — Produces the unoptimized AST that this crate optimizes
+- **cuda-oxide** — Uses optimized ASTs for GPU code generation
+
+The conservation link γ + η = C applies: γ (reduced expressions) + η (eliminated operations) = C (total semantic content). Optimization preserves C exactly — no information is lost, only representation changes.
+
+See the full architecture: [ARCHITECTURE.md](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md)
 
 ## References
 
-1. Aho, Lam, Sethi, Ullman. *Compilers: Principles, Techniques, and Tools* (Dragon Book), 2nd ed., Chapter 8.
-2. Click, C. "Combining Analyses, Combining Optimizations." *ACM TOPLAS*, 1995.
-3. Tate, Stepp, Tatlock, Lerner. "Equality Saturation: A New Approach to Optimization." *POPL 2009*.
+1. Aho, A.V., Lam, M.S., Sethi, R., & Ullman, J.D. (2006). *Compilers: Principles, Techniques, and Tools,* 2nd ed. Pearson. Chapter 8 (code optimization).
+2. Appel, A.W. (2004). *Modern Compiler Implementation.* Cambridge University Press.
+3. LLVM Project. "LLVM Language Reference Manual: Constant Folding." [llvm.org/docs](https://llvm.org/docs/LangRef.html)
+4. Kildall, G.A. (1973). "A Unified Approach to Global Program Optimization." *POPL '73.* — Lattice-based optimization framework.
 
 ## License
 
